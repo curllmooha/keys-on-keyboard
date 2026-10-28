@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keyboard Motion</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f3ede3; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  body::after { content: ''; position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at 50% 45%, rgba(0,0,0,0) 55%, rgba(50,35,20,0.18) 100%); }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xf3ede3);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.5;
+scene.fog = new THREE.Fog(0xf3ede3, 24, 48);
+
+const camera = new THREE.PerspectiveCamera(26, innerWidth / innerHeight, 0.1, 200);
+
+const sun = new THREE.DirectionalLight(0xffeed8, 3.4);
+sun.position.set(-9, 12, 5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -24, right: 24, top: 18, bottom: -18, near: 1, far: 50 });
+sun.shadow.radius = 6;
+sun.shadow.bias = -0.0003;
+sun.shadow.normalBias = 0.07;
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xe6edff, 0xcfc4b4, 0.4));
+const rim = new THREE.DirectionalLight(0xb6c4ff, 1.1);   // cool rim from the right
+rim.position.set(10, 6, -4);
+scene.add(rim);
+const fill = new THREE.DirectionalLight(0xffd9c2, 0.5);  // warm bounce from the front
+fill.position.set(2, 4, 12);
+scene.add(fill);
+
+// ---------- keycap geometry: tapered sides, dished top, soft edges ----------
+const KEY_H = 0.6, GAP = 0.03;
+const geoCache = new Map();
+function keyGeo(w) {
+  const id = w.toFixed(2);
+  if (geoCache.has(id)) return geoCache.get(id);
+  const W = w - GAP, D = 1 - GAP;
+  const g = new RoundedBoxGeometry(W, KEY_H, D, 12, 0.17);
+  const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    let x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const h = Math.min(1, Math.max(0, (y + KEY_H / 2) / KEY_H)); // 0 bottom .. 1 top
+    const taper = 1 - 0.13 * Math.pow(h, 1.3);        // narrower toward the top
+    x *= taper; z *= taper;
+    if (h > 0.97) {                                   // spherical dish on the top face
+      const nx = x / (W / 2), nz = z / (D / 2);
+      const r2 = Math.min(1, nx * nx + nz * nz);
+      y -= 0.03 * (1 - r2);
+    }
+    p.setXYZ(i, x, y, z);
+  }
+  g.deleteAttribute('normal');
+  g.deleteAttribute('uv');
+  const welded = mergeVertices(g, 1e-4);
+  welded.computeVertexNormals();
+  const wp = welded.attributes.position, uv = new Float32Array(wp.count * 2);
+  for (let i = 0; i < wp.count; i++) { uv[i * 2] = wp.getX(i) * 0.9; uv[i * 2 + 1] = wp.getZ(i) * 0.9; }
+  welded.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  geoCache.set(id, welded);
+  return welded;
+}
+
+// fine grain texture (PBT-style) used as a bump map
+const grain = (() => {
+  const S = 256, cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d'), img = g.createImageData(S, S);
+  for (let i = 0; i < S * S; i++) {
+    const v = Math.random() < 0.5 ? 70 + Math.random() * 40 : 170 + Math.random() * 85;
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(cv);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(12, 12);
+  t.anisotropy = 8;
+  return t;
+})();
+const matCache = new Map();
+const keyMat = (c) => {
+  if (!matCache.has(c)) matCache.set(c, new THREE.MeshPhysicalMaterial({
+    color: c, roughness: 0.55, bumpMap: grain, bumpScale: 9, clearcoat: 0.12, clearcoatRoughness: 0.6,
+    sheen: 0,
+  }));
+  return matCache.get(c);
+};
+
+// ---------- palette ----------
+const PALETTE = [
+  [0xfaf5ec, 18], // warm white
+  [0xe3dfd8, 9],  // light grey
+  [0xc4c1bb, 4],  // mid grey
+  [0xf2cc8f, 9],  // tan
+  [0xf45a3f, 6],  // coral
+  [0x6fd3b0, 8],  // mint
+  [0x1a46f0, 7],  // blue
+  [0xffc72e, 3],  // yellow
+];
+const total = PALETTE.reduce((s, p) => s + p[1], 0);
+let seed = 11;
+const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const pickColor = () => {
+  let r = rnd() * total;
+  for (const [c, w] of PALETTE) { if ((r -= w) < 0) return c; }
+  return PALETTE[0][0];
+};
+
+function labelTexture(text, color) {
+  const cv = document.createElement('canvas');
+  cv.width = 512; cv.height = 512;
+  const g = cv.getContext('2d');
+  let size = 150;
+  g.font = `700 ${size}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+  while (g.measureText(text).width > 400 && size > 40) { size -= 6; g.font = `700 ${size}px "Helvetica Neue", Helvetica, Arial, sans-serif`; }
+  g.fillStyle = color;
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(text, 256, 268);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 8;
+  return t;
+}
+
+// ---------- keyboard ----------
+const board = new THREE.Group();
+scene.add(board);
+const keys = [];
+const feature = {};
+
+function addKey(x, z, w, color, label) {
+  const m = new THREE.Mesh(keyGeo(w), keyMat(color));
+  m.position.set(x, 0, z);
+  m.castShadow = true;
+  board.add(m);
+  const k = { mesh: m, press: 0, label: null };
+  if (label) {
+    const plane = new THREE.Mesh(
+      new THREE.PlaneGeometry(w - GAP - 0.1, 1 - GAP - 0.1),
+      new THREE.MeshBasicMaterial({ map: labelTexture(label.text, label.color), transparent: true, toneMapped: false, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 })
+    );
+    plane.rotation.x = -Math.PI / 2;
+    plane.position.y = KEY_H / 2 - 0.012;
+    m.add(plane);
+    k.label = plane;
+  }
+  keys.push(k);
+  return k;
+}
+
+const COLS = 40, ROWS = 28;
+const FEATURES = [
+  { id: 'a', r: 0, x: -0.5, text: 'make', c: 0x2d4fe0, tc: '#eaf0ff' },
+  { id: 'b', r: 0, x: 0.5,  text: 'it',   c: 0xeeebe6, tc: '#17171b' },
+  { id: 'c', r: 1, x: -0.5, text: 'feel', c: 0xeeebe6, tc: '#ee5a1c' },
+  { id: 'd', r: 1, x: 0.5,  text: 'good', c: 0x4cc9a0, tc: '#ffffff' },
+];
+const midRow = Math.floor(ROWS / 2) - 1;
+
+for (let r = 0; r < ROWS; r++) {
+  const z = (r - ROWS / 2);
+  const frow = FEATURES.filter(f => midRow + f.r === r);
+  let x = -COLS / 2;
+  const end = COLS / 2;
+  while (x < end - 0.01) {
+    const f = frow.find(f => Math.abs(f.x - (x + 0.5)) < 0.01);
+    if (f) { feature[f.id] = addKey(x + 0.5, z, 1, f.c, { text: f.text, color: f.tc }); x += 1; continue; }
+    const nextF = frow.map(f => f.x - 0.5).filter(fx => fx > x - 0.01).sort((a, b) => a - b)[0];
+    const room = (nextF !== undefined ? nextF : end) - x;
+    if (room < 0.99) { x += room; continue; }
+    const opts = [1, 1, 1, 1, 1, 1, 1, 1, 1.5, 2].filter(o => o <= room + 0.001);
+    const w = opts[Math.floor(rnd() * opts.length)];
+    addKey(x + w / 2, z, w, pickColor());
+    x += w;
+  }
+}
+
+// dark case plate visible in the gaps
+const plate = new THREE.Mesh(
+  new THREE.BoxGeometry(COLS + 8, 0.3, ROWS + 8),
+  new THREE.MeshStandardMaterial({ color: 0x3a332b, roughness: 0.9 })
+);
+plate.position.y = -0.55;
+plate.receiveShadow = true;
+board.add(plate);
+
+// ---------- timeline ----------
+const LOOP = 8.0;
+const SEQ = [{ k: 'a', t: 1.0 }, { k: 'b', t: 2.1 }, { k: 'c', t: 3.2 }, { k: 'd', t: 4.3 }];
+const bell = (u) => (u <= 0 || u >= 1) ? 0 : Math.sin(Math.PI * Math.pow(u, 0.7));
+const PRESS_DUR = 0.55;
+
+const ambient = [];
+for (let i = 0; i < 60; i++) {
+  ambient.push({ k: keys[Math.floor(rnd() * keys.length)], t: rnd() * LOOP, d: 0.3 + rnd() * 0.25, a: 0.25 + rnd() * 0.45 });
+}
+
+board.rotation.y = -0.62;
+
+function fitCamera(t) {
+  camera.aspect = innerWidth / innerHeight;
+  const drift = Math.sin(t * 0.18);
+  const dist = 15.5 + Math.sin(t * 0.12) * 0.6;
+  const elev = 0.95 + drift * 0.04;
+  camera.position.set(drift * 0.6, Math.sin(elev) * dist, Math.cos(elev) * dist);
+  camera.lookAt(drift * 0.4, 0, 0);
+  camera.updateProjectionMatrix();
+}
+
+function update(t) {
+  const lt = t % LOOP;
+  for (const k of keys) k.press = 0;
+  for (const a of ambient) {
+    const u = ((lt - a.t + LOOP) % LOOP) / a.d;
+    if (u < 1) a.k.press = Math.max(a.k.press, bell(u) * a.a);
+  }
+  for (const s of SEQ) {
+    const u = (lt - s.t) / PRESS_DUR;
+    feature[s.k].press = Math.max(feature[s.k].press, bell(u));
+  }
+  for (const k of keys) k.mesh.position.y = -k.press * 0.3;
+}
+
+addEventListener('resize', () => renderer.setSize(innerWidth, innerHeight));
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const t = clock.getElapsedTime();
+  update(t);
+  fitCamera(t);
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
